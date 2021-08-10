@@ -1,0 +1,124 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+#
+# This file is the copyrighted property of Tableau Software and is protected
+# by registered patents and other applicable U.S. and international laws and
+# regulations.
+#
+# Unlicensed use of the contents of this file is prohibited. Please refer to
+# the NOTICES.txt file for further details.
+#
+# -----------------------------------------------------------------------------
+
+set -o xtrace
+set -o nounset
+set -o errexit
+
+if [ -f "${ENV_FILE}" ]; then
+    export $(sed -e '/^#/d' ${ENV_FILE} | xargs) > /dev/null 2>&1
+fi
+
+setup_basic_variables() {
+    data_dir="${DATA_DIR}"
+    package_dir="${INSTALL_DIR}"/packages
+    scripts_dir="${package_dir}"/scripts."${SERVICE_VERSION}"
+    bin_dir="${package_dir}"/bin."${SERVICE_VERSION}"
+    user_home="${DOCKER_CONFIG}/user"
+    remote_group=remote
+    remote_user_home=/home/remoteuser
+}
+
+setup_users_and_groups() {
+    if id -u "${UNPRIVILEGED_USERNAME}" > /dev/null 2>&1; then
+        return
+    fi
+
+    data_dir_parent=$(readlink -m "${data_dir}"/..)
+    if [ ! -d "${data_dir_parent}" ]; then
+        mkdir -p "${data_dir_parent}"
+    fi
+
+    groupadd -g "${PRIVILEGED_TABLEAU_GID}" --system -f "${PRIVILEGED_GROUP_NAME}"
+    groupadd -g "${UNPRIVILEGED_TABLEAU_GID}" --system -f "${UNPRIVILEGED_GROUP_NAME}"
+    useradd --system --comment "Tableau Server" -u "${UNPRIVILEGED_TABLEAU_UID}" --shell /bin/bash --create-home --home-dir "${user_home}" -g "${UNPRIVILEGED_GROUP_NAME}" "${UNPRIVILEGED_USERNAME}"
+    usermod -a -G "${PRIVILEGED_GROUP_NAME}" "${UNPRIVILEGED_USERNAME}" 2>&1 | grep -v "usermod: no changes" || true
+
+    if [ -f "${ENV_FILE}" ]; then
+        echo "export \$(sed -e '/^#/d'" "${ENV_FILE}" "| xargs) > /dev/null 2>&1" >> "${user_home}/.bashrc"
+    fi
+
+    # create tsm user if it exists
+    if [ ! -z "${TSM_REMOTE_USERNAME}" ]; then
+        setup_remote_user_shell
+        # create initial remote user
+        useradd --system --comment "TSM remote user" -u "${TSM_REMOTE_UID}" --shell /bin/rbash --home-dir "${remote_user_home}" -g "${remote_group}" "${TSM_REMOTE_USERNAME}"
+        # establish empty password for user
+        passwd -f -u "${TSM_REMOTE_USERNAME}"
+        # add to privileged group for TSM authentication
+        usermod -a -G "${PRIVILEGED_GROUP_NAME}" "${TSM_REMOTE_USERNAME}"
+    fi
+}
+
+setup_remote_user_shell() {
+    groupadd "${remote_group}"
+    # create directory for remote user
+    mkdir -p "${remote_user_home}/programs"
+    # create rbash shell
+    cp /bin/bash /bin/rbash
+    # symlink true such that the command is executable by this user (tsm auth)
+    ln -s /bin/true "${remote_user_home}"/programs/true
+    # symlink passwd such that the command is executable by this user
+    ln -s /bin/passwd "${remote_user_home}"/programs/passwd
+    # copy in rpasswd executable
+    cp ${DOCKER_CONFIG}/rpasswd "${remote_user_home}"/programs/
+    # rpasswd has no other purpose, doing this copy/delete action saves us from making a docker layer just to handle this operation
+    rm ${DOCKER_CONFIG}/rpasswd
+    # write the .bash_profile such that the user's path is only to the programs directory
+    /bin/cat <<EOM >"${remote_user_home}/.bash_profile"
+PATH=\$HOME/programs
+export PATH
+EOM
+    chown -R root:"${remote_group}" "${remote_user_home}"
+    chmod 750 -R "${remote_user_home}"
+}
+
+setup_data_dir() {
+    "${scripts_dir}"/initialize-tsm --accepteula -a "${UNPRIVILEGED_USERNAME}" --unprivileged-user="${UNPRIVILEGED_USERNAME}" --tsm-authorized-group="${PRIVILEGED_GROUP_NAME}" --disable-account-creation
+}
+
+create_files_and_directories() {
+    # Create directory for staging temporary files
+    mkdir -p "${DOCKER_TMP}"
+
+    # If a registeration file mount is provided, then generate the registration file.
+    if [ ! -z "${REGISTRATION_DATA}" ]; then
+        echo "${REGISTRATION_DATA}" > "${REGISTRATION_FILE}"
+    fi
+
+    # If config data is provided, then generate the config file.
+    if [ ! -z "${CONFIG_DATA}" ]; then
+        echo "${CONFIG_DATA}" > "${CONFIG_FILE}"
+    fi
+
+    # Create a velocity.log file here because of the working directory for all services of supervisord is set to the root 
+    # directory of the system, causing Spring not able to start velocity engine when configuring SAML for server. So the 
+    # hack here is to create a velocity.log under ${data_dir} before server is initialized and also create a symlink under
+    # root directory. This is a temporary solution. The permanent solution would be change the working dirs for all services
+    # of supervisord to be under ${data_dir} which will require monolith change.
+    ln -s "${data_dir}/velocity.log" /velocity.log
+}
+
+setup_permissions() {
+    chown "${UNPRIVILEGED_TABLEAU_UID}":"${UNPRIVILEGED_TABLEAU_GID}" "${data_dir_parent}"
+    chown -R "${UNPRIVILEGED_TABLEAU_UID}":"${UNPRIVILEGED_TABLEAU_GID}" "${DOCKER_CONFIG}"
+}
+
+main() {
+    setup_basic_variables
+    setup_users_and_groups
+    setup_data_dir
+    create_files_and_directories
+    setup_permissions
+}
+
+main "$@"

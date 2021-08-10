@@ -1,0 +1,72 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+#
+# This file is the copyrighted property of Tableau Software and is protected
+# by registered patents and other applicable U.S. and international laws and
+# regulations.
+#
+# Unlicensed use of the contents of this file is prohibited. Please refer to
+# the NOTICES.txt file for further details.
+#
+# -----------------------------------------------------------------------------
+
+# This is a complicated way of saying 'printenv > /docker/env' except this code
+# will ensure that all values are quoted to protect any whitespace.
+while IFS='=' read -r -d '' key val; do
+    printf "%s=\"%s\"\n" "${key}" "${val}"
+done < <(env -0) > ${DOCKER_CONFIG}/env
+
+check_tsm_status() {
+  tsm status | grep -E "RUNNING|STOPPED"
+}
+
+# Waits for 30 mins for Tableau Server to start.
+wait_for_tableau_server_to_be_ready() {
+  local running_or_stopped="$1"
+  local command_to_run=""
+  if [[ "${running_or_stopped}" == 'true' ]]; then
+    command_to_run=check_tsm_status
+  else
+    command_to_run=/docker/server-ready-check
+  fi
+  
+  for (( t=1; t<60; t++ ))
+  do  
+    "${command_to_run}"
+    if [ $? -eq 0 ]; then
+      echo "Tableau Server is Running"
+      return 0
+    fi
+    sleep 30
+  done    
+  return 1
+}
+
+run_upgrade() {
+  echo "Running upgrade script"
+  ${INSTALL_DIR}/packages/scripts.${UPGRADE_VERSION}/upgrade-tsm --accepteula --no-prompt
+
+  tsm start
+
+  if ! wait_for_tableau_server_to_be_ready false; then
+    echo "Tableau Server failed to start after upgrade"
+    exit 1
+  fi
+}
+
+upgrade_init() {
+  echo "running upgrade"
+  if ! wait_for_tableau_server_to_be_ready true; then
+    echo "Tableau Server failed to start before upgrade"
+    exit 1
+  fi
+}
+
+main() {
+  /docker/start-process-manager &
+  upgrade_init
+  run_upgrade
+  echo "upgrade is complete"  
+}
+
+main "$@"

@@ -1,0 +1,89 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+#
+# This file is the copyrighted property of Tableau Software and is protected
+# by registered patents and other applicable U.S. and international laws and
+# regulations.
+#
+# Unlicensed use of the contents of this file is prohibited. Please refer to
+# the NOTICES.txt file for further details.
+#
+# -----------------------------------------------------------------------------
+#
+###############################################################################################
+###############################################################################################
+# 
+# This script runs as the unprivileged user and is started by supervisord
+#
+###############################################################################################
+###############################################################################################
+
+set -o xtrace
+set -o nounset
+set -o errexit
+set -o errtrace
+
+server_install_error_file="${DATA_DIR}/logs/server-install-error"
+exit_container() {
+	touch "${server_install_error_file}"
+	supervisorctl -c "${DATA_DIR}"/supervisord/supervisord.conf shutdown
+}
+
+trap exit_container ERR
+
+rm -f "${server_install_error_file}"
+umask 007
+
+set -a
+source /docker/env
+set +a
+
+install_dir="${INSTALL_DIR}"
+version_string="${SERVICE_VERSION}"
+
+source ${install_dir}/packages/scripts.${version_string}/initialize-tsm-common
+
+init_options
+
+data_dir="${DATA_DIR}"
+config_name=tabsvc
+unprivileged_username="${UNPRIVILEGED_USERNAME}"
+tsm_authorized_groupname="${PRIVILEGED_GROUP_NAME}"
+tsm_config_file="${DATA_DIR}/config/tabsvc.yml"
+
+activation_service=1
+port_range_min="${PORT_RANGE_MIN}"
+port_range_max="${PORT_RANGE_MAX}"
+zk_client_port="${COORDINATION_SERVICE_CLIENT_PORT}"
+zk_peer_port="${COORDINATION_SERVICE_PEER_PORT}"
+zk_leader_port="${COORDINATION_SERVICE_LEADER_PORT}"
+license_vd_port="${LICENSE_SERVICE_VENDOR_DAEMON_PORT}"
+agent_ft_port="${AGENT_FILE_TRANSFER_PORT}"
+controller_port="${CONTROLLER_PORT}"
+
+# The server install command has embedded quotes to protect whitespace if either the 
+# data dir or install dir contains whitespace. Even though there is no whitespace in
+# this container, the quotes are still there, so eval the command the force bash to
+# see the quotes as protecting whitespace instead of as characters that are part of
+# argument(s).
+
+test -r "${data_dir}"
+
+if [ "${BOOTSTRAP_INSTALL}" -eq "1" ]; then
+    set_worker_install_server_cmd
+
+    eval "${worker_install_server_cmd[@]}"
+else
+    set_install_server_cmd
+    
+    eval "${install_server_cmd[@]}"
+fi
+
+if [ "${TSM_ONLY}" -eq "0" ] && [ "${BOOTSTRAP_INSTALL}" -eq "0" ]; then
+    "${DOCKER_CONFIG}"/config/tsm-commands
+fi
+
+if [ "${INIT_CONTAINER}" -eq "1" ]; then
+    # This isn't the fastest shutdown in the world. supervisord doesn't have a "kill immediately" command
+    supervisorctl -c "${data_dir}"/supervisord/supervisord.conf shutdown
+fi

@@ -1,0 +1,220 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+#
+# This file is the copyrighted property of Tableau Software and is protected
+# by registered patents and other applicable U.S. and international laws and
+# regulations.
+#
+# Unlicensed use of the contents of this file is prohibited. Please refer to
+# the NOTICES.txt file for further details.
+#
+# -----------------------------------------------------------------------------
+
+set -e
+set -o xtrace
+set -o errexit
+
+initialize_variables() {
+    node_count=$(jq 'select(.topologyVersion.nodes)|.topologyVersion.nodes|keys|length' "${CONFIG_FILE}")
+    if [ -z "${node_count}" ]; then
+        node_count=1
+    fi
+}
+
+activate_licenses() {
+    #Check activated license, if result is greater than 1, system exists activated license
+    license_count=$(tsm licenses list | wc -l)
+    if [ -z "${LICENSE_KEY}" ] && [ ! -f "${LICENSE_KEY_FILE}" ]; then
+        if [ "${license_count}" -le 1 ]; then
+            echo "No License Key or License Key File provided, invalid configuration. Exiting..."
+            exit 1
+        fi
+    elif [ -n "${LICENSE_KEY}" ] && [ -f "${LICENSE_KEY_FILE}" ]; then
+        echo "Cannot provide both License Key and License Key file, invalid configuration. Exiting..."
+        exit 1
+    elif [ -n "${LICENSE_KEY}" ]; then
+        activate_license_with_key
+    else
+        activate_license_with_file
+    fi
+}
+
+activate_license_with_key() {
+    #Multiple license keys separate with commas in LICENSE_KEY, allow leading and trailing spaces with license key.
+    IFS=',' read -r -a lic_list <<< "${LICENSE_KEY}"
+    for license in "${lic_list[@]}"; do
+        if [ -n "${license}" ]; then
+            #Activate license key one by one, trim leading and trailing spaces of license key.
+            tsm licenses activate -k "$(echo "${license}" | awk '{$1=$1};1')"
+        fi
+    done
+}
+
+activate_license_with_file() {
+    if [ -s "${LICENSE_KEY_FILE}" ]; then
+        while read -r line || [ -n "$line" ]; do
+            if [ -n "${line}" ]; then
+                #The format of LICENSE_KEY_FILE file is one license key per line, below command will
+                #trim leading and trailing spaces of license key.
+                tsm licenses activate -k "$(echo "${line}" | awk '{$1=$1};1')"
+            fi
+        done < "${LICENSE_KEY_FILE}"
+    else
+        if [ "${license_count}" -le 1 ]; then
+            echo "No license keys found in license file. Exiting..."
+            exit 1
+        fi
+    fi
+}
+
+register() {
+    echo "Registering Tableau Server"
+    if [  ! -f "${REGISTRATION_FILE}" ]; then
+        echo "No Registration file provided, the server cannot be registered. Exiting..."
+        exit 1
+    fi
+
+    tsm register --file "${REGISTRATION_FILE}"
+}
+
+set_memory_limits() {
+    # set memory usage limit by the docker container. Only set the value when memory.limit_in_bytes is set. 
+    # Otherwise, this number will be 9223372036854771712, which is the larges 64 bit number.
+    memory_limit=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes | awk '{ byte =$1 /1024/1024/1024; print byte}')
+    if [[ "${memory_limit}" != *"e+"* ]]; then
+        tsm configuration set -k native_api.memory_limit_all_processes_gb -v $(printf '%.0f\n' $(expr $memory_limit*0.95 | bc)) --force-keys
+        tsm configuration set -k native_api.memory_limit_per_process_gb -v $(printf '%.0f\n' $(expr $memory_limit*0.7 | bc)) --force-keys
+    fi    
+}
+
+deploy_coordination_serv_ensemble() {
+    coordination_serv_nodes_count=$(jq '[select(.topologyVersion.nodes) | .topologyVersion.nodes | to_entries[] | select(any(.value[]; has("appzookeeper"))) | .key ] | length' "${CONFIG_FILE}")
+    coordination_serv_deploy_nodes=$(jq -r '[select(.topologyVersion.nodes)| .topologyVersion.nodes | to_entries[] | select(any(.value[]; has("appzookeeper"))) | .key] |reduce .[1:][] as $i ("\(.[0])"; . + ",\($i)" )' "${CONFIG_FILE}")
+    if [ "${coordination_serv_nodes_count}" -eq "3" ] || [ "${coordination_serv_nodes_count}" -eq "5" ]; then
+        echo "Deploying coordination service ensemble..."
+        tsm stop
+        # deploy a Coordination Service ensemble
+        if tsm topology deploy-coordination-service -n "${coordination_serv_deploy_nodes}" --ignore-prompt; then
+            echo "Deploy a Coordination Service ensemble on nodes: ${coordination_serv_deploy_nodes} successfully"
+        else
+            echo "Fail to deploy a Coordination Service ensemble on nodes: ${coordination_serv_deploy_nodes}"
+            tsm topology cleanup-coordination-service
+        fi
+        tsm start
+    fi
+}
+
+apply_topology() {
+    # If multi-node topology is detected or the bootstrap write env var is specified, write the file
+    if [ "${node_count}" -ge "2" ] || [ "${ALWAYS_WRITE_BOOTSTRAP_FILE}" -eq "1" ]; then
+        tsm topology nodes get-bootstrap-file -f "${BOOTSTRAP_FILE}"
+        echo "TSM Cluster Bootstrap file written: ${BOOTSTRAP_FILE}"
+    fi
+
+    if [ "${IGNORE_TOPOLOGY_CONFIG}" -ne "0" ]; then
+        echo "IGNORE_TOPOLOGY_CONFIG is non-zero. Skipping topology setup steps."
+    else
+        if [ "${node_count}" -ge "2" ]; then
+            # Multi-node topology case
+            echo "Multi-node topology detected."
+            echo "Waiting for all cluster nodes to register with inital node..."
+            while [ $(tsm topology list-nodes | wc -l) -ne "${node_count}" ]; do
+                sleep 5
+            done
+            # Create a new config file with appzookeeper omitted from the topology section except node1
+            topology_config=$(jq 'select(.topologyVersion.nodes)| .topologyVersion.nodes | with_entries(if (.key != "node1") then del(.value.services.appzookeeper) else . end)' "${CONFIG_FILE}")
+            cat "${CONFIG_FILE}" | jq --argjson v "$topology_config" '.topologyVersion.nodes=$v' > ${DOCKER_TMP}/config-tmp.json
+        else
+            # Single-node topology case
+            cp "${CONFIG_FILE}" "${DOCKER_TMP}/config-tmp.json"
+        fi
+
+        echo "Applying topology to Tableau Server..."
+        if  tsm settings import -f "${DOCKER_TMP}"/config-tmp.json --topology-only; then
+            tsm pending-changes apply -iw --ignore-prompt
+        else
+            echo "No topology settings applied. Continuing on..."
+        fi
+        # Coordination service ensemble deployment happens only in the multi-node case
+        deploy_coordination_serv_ensemble
+    fi
+}
+
+restore_from_backup() {
+    cp "${BACKUP_FILE}" "$DATA_DIR/data/tabsvc/files/backups/"
+    tsm stop
+    tsm maintenance restore --file "$(basename ${BACKUP_FILE})" 
+    tsm start
+}
+
+post_init_setup() {
+    echo "Waiting for server to be ready..."
+    while ! /docker/server-ready-check; do
+        sleep 5
+    done
+    echo "Server startup complete!"
+
+    if [ -n "${TABLEAU_USERNAME}" ]; then
+        echo "Creating initial user..."
+
+        # retrieve password
+        tableau_pw=""
+        set +o xtrace
+        if [ -n "${TABLEAU_PASSWORD}" ]; then
+            tableau_pw="${TABLEAU_PASSWORD}"
+        elif [ -f "${TABLEAU_PASSWORD_FILE}" ]; then
+            # "read" returns a nonzero status if the password file doesn't end in a new line. add "|| true" to let the script continue
+            read -r tableau_pw<"${TABLEAU_PASSWORD_FILE}" || true
+            if [ -z "${tableau_pw}" ]; then
+                set -o xtrace
+                echo "Tableau Password File is invalid. Exiting..."
+                exit 1
+            fi
+        fi
+
+        set +o xtrace
+        if [ -n "${tableau_pw}" ]; then
+            tabcmd initialuser -s localhost:8080 -u "${TABLEAU_USERNAME}" -p "${tableau_pw}"
+            set -o xtrace
+            echo "Initial user created."
+        else
+            echo "No password found for initial user, skipping account creation..."
+        fi
+    else
+        echo "NOTE: An initial user will need to be created for Tableau Server to allow remote connections"
+    fi
+}
+
+main() {
+    # run customer command file before initialization
+    if [ -f "${PRE_INIT_COMMAND_SCRIPT}" ]; then
+        "${PRE_INIT_COMMAND_SCRIPT}"
+    fi
+
+    initialize_variables
+    set_memory_limits
+ 
+    tsm settings import -f "${CONFIG_FILE}" --force-keys --config-only
+    tsm pending-changes apply -iw --ignore-prompt
+
+    activate_licenses
+    register
+
+    echo "Starting Server..."
+    tsm initialize --start-server
+    
+    apply_topology
+
+    if [ -f "${BACKUP_FILE}" ]; then
+        restore_from_backup
+    else
+        post_init_setup
+    fi
+
+    # run customer command file after initialization
+    if [ -f "${POST_INIT_COMMAND_SCRIPT}" ]; then
+        "${POST_INIT_COMMAND_SCRIPT}"
+    fi
+}
+
+main "$@"

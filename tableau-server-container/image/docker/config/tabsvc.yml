@@ -1,0 +1,4 @@
+config.version: 21
+
+worker0.gateway.port: 8080
+worker0.ssl.port: 8443

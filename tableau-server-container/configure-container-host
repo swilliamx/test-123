@@ -1,0 +1,247 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+#
+# This file is the copyrighted property of Tableau Software and is protected
+# by registered patents and other applicable U.S. and international laws and
+# regulations.
+#
+# Unlicensed use of the contents of this file is prohibited. Please refer to
+# the NOTICES.txt file for further details.
+#
+# -----------------------------------------------------------------------------
+
+#log the trace output of this script to a file while the rest of the output goes to the terminal
+trace_file="/var/tmp/configure-container-host-$(date +%y.%m%d.%H%M.%S).log"
+exec 11>"${trace_file}"
+BASH_XTRACEFD=11
+set -o xtrace
+
+set -o nounset # exit script if trying to use an uninitialized variable
+set -o errexit # exit the script if any statement returns a non-true return value
+
+show_help() {
+  cat <<EOM
+
+Usage: $(basename "$0") [-h] <-d | -u <unprivileged_uid>>
+
+Make host system changes for Tableau Server running in a container. Must be run as root.
+
+  -h                                      Show this message.
+
+  -u <unprivileged_uid>                   Configure the host given this UID of the Tableau Server
+                                          unprivileged user. This UID should match the UID set in
+                                          the Tableau Server container 'UNPRIVILEGED_TABLEAU_UID'
+                                          environment variable.
+
+  -d                                      Delete any configuration from a previous run of this script.
+
+EOM
+}
+
+delete_all_settings() {
+  echo "Deleting settings from this machine made by a previous run of this script."
+  echo "To be sure that the host has its original settings, reboot the host."
+  rm -f /etc/security/limits.d/99-tableau_server.conf
+  rm -f /etc/sysctl.d/99-tableau-server.conf
+  rm -f /etc/systemd/logind.conf.d/tableau_server.conf
+  rm -f /etc/systemd/system/user-.slice.d/tableau_server.conf
+}
+
+setup_unlimited_tasks() {
+  # Don't attempt to write this setting on systems where it's not defined in logind.conf
+  # This setting exists on RHEL/Centos 7.X systems, Ubuntu 18.04 and Debian 9 systems but
+  # not on RHEL8 systems. We don't want a global limit in the user slice definition to
+  # inhibit creation of threads/processes by the unprivileged user.
+  if grep -q UserTasksMax /etc/systemd/logind.conf; then
+    mkdir -p /etc/systemd/logind.conf.d
+    local logind_conf=/etc/systemd/logind.conf.d/tableau_server.conf
+    echo "[Login]" > "${logind_conf}"
+    echo "UserTasksMax=infinity" >> "${logind_conf}"
+    echo "Set UserTasksMax=infinity in ${logind_conf}"
+  fi
+
+  # On RHEL8 systems, the max number of threads/processes created by any user slice defaults
+  # to 80% of the system max. Override that to infinity.
+  if [ -d /lib/systemd/system/user-.slice.d ]; then
+    mkdir -p /etc/systemd/system/user-.slice.d
+    local slice_conf=/etc/systemd/system/user-.slice.d/tableau_server.conf
+    echo "[Slice]" > "${slice_conf}"
+    echo "TasksMax=infinity" >> "${slice_conf}"
+    echo "Set TasksMax=infinity in ${slice_conf}"
+  fi
+
+  # Make sure the pids.max setting of the user slice of the unprivileged user is set to "max"
+  # Only set this file if it already exists. CentOS7.X systems don't have it.
+  local pids_max=/sys/fs/cgroup/pids/user.slice/user-${unprivileged_uid}.slice/pids.max
+  if [ -f "${pids_max}" ]; then
+    echo "max" > "${pids_max}"
+  fi
+}
+
+setup_sysctl_settings() {
+  local -r sysctl_file=/etc/sysctl.d/99-tableau-server.conf
+
+  echo "Writing Tableau Server sysctl settings to ${sysctl_file} and loading them"
+
+  rm -rf "${sysctl_file}"
+
+  local -r cur_pat=$(< /proc/sys/kernel/core_pattern)
+
+  # Tableau Server takes over the core_pattern on the machine if the current pattern is a default we recognize
+  if [[ "${cur_pat}" != core* && "${cur_pat}" != *apport* ]]; then
+    echo "Overwriting non-distro default /proc/sys/kernel/core_pattern"
+    echo "Old value: ${cur_pat}"
+    echo "New core_pattern saved to ${sysctl_file}"
+    echo "If the old value should be kept, delete kernel.core_pattern from ${sysctl_file}"
+    echo "And run the command 'echo ${cur_path} > /proc/sys/kernel/core_pattern'"
+  fi
+
+  # %p PID
+  # %s signal that caused crash
+  # %t time of crash, expressed as seconds since 1/1/1970
+  # %E path to crashing executable with ! as a separator
+  echo "kernel.core_pattern = coredump:%p:%s:%t:%E" >> "${sysctl_file}"
+
+  local sem
+  read -r -a sem <<< "$(< /proc/sys/kernel/sem)"
+
+  # /proc/sys/kernel/sem represents SEMMSL, SEMMNS, SEMOPM, and SEMMNI.
+  # SEMMSL  maximum number of semaphores per array
+  # SEMMNS  maximum semaphores system-wide
+  # SEMOPM  maximum operations per semop call
+  # SEMMNI  maximum arrays
+  # SEMMNS = SEMMSL * SEMMNI
+  #
+  # The defaults:
+  #      RHEL      250        32000       32       128
+  #      Ubuntu: 32000   1024000000      500     32000
+  #
+  # Postgres can need a large number of semaphore sets (SEMMNI) especially if
+  # *two* databases are run simultaneously which can happen during a Server
+  # backup. On RHEL, the default number of SEMMNI is 128 which is just too low.
+  # Raise it.
+  if [ ${#sem[@]} -ne 4 ]; then
+    echo "Could not parse /proc/sys/kernel/sem '${sem[*]}'. Expecting four values."
+  else
+    if [ "${sem[3]}" -le "2048" ]; then
+      sem[3]=2048
+    fi
+
+    # if SEMMNS is less than the product of SEMMSL and SEMMNI, then make it so
+    local semmns=$(( sem[0] * sem[3] ))
+    if [ "${sem[1]}" -le "${semmns}" ]; then
+      sem[1]=$semmns
+    fi
+
+    echo "kernel.sem = ${sem[*]}" >> "${sysctl_file}"
+  fi
+
+  # These settings need to be increased to give Tableau Server processes the ability
+  # to create the threads it needs. Beside all the user limits we have raised or eliminated
+  # there is also a hard machine limit. Both kernel.pid_max and kernel.threads-max can bound
+  # the number of threads. Only raise kernel.pid_max because kernal.threads-max normally
+  # defaults to a much higher value. vm.max_map_count is raised both to allow more threads
+  # to be created but also because multinode elasticserver requires it.
+  echo "vm.max_map_count = 262144" >> "${sysctl_file}"
+  echo "kernel.pid_max = 131072" >> "${sysctl_file}"
+
+  sysctl -q --load="${sysctl_file}"
+}
+
+setup_limits() {
+  if [ ! -d /etc/security/limits.d ]; then
+    echo "Creating non-existent directory /etc/security/limits.d"
+    mkdir -p -m 755 /etc/security/limits.d
+  fi
+
+  limits_file=/etc/security/limits.d/99-tableau_server.conf
+
+  echo "Writing expanded core/process/file limits for UID ${unprivileged_uid} to ${limits_file}"
+
+  echo "# Tableau Server limits" > "${limits_file}"
+  echo "" >> "${limits_file}"
+  echo ":${unprivileged_uid} hard core   unlimited" >> "${limits_file}"
+  echo ":${unprivileged_uid} soft core   unlimited" >> "${limits_file}"
+  echo ":${unprivileged_uid} hard nproc  unlimited" >> "${limits_file}"
+  echo ":${unprivileged_uid} soft nproc  unlimited" >> "${limits_file}"
+  echo ":${unprivileged_uid} hard nofile 131072" >> "${limits_file}"
+  echo ":${unprivileged_uid} soft nofile 131072" >> "${limits_file}"
+}
+
+get_arguments() {
+  unprivileged_uid=
+  delete=false
+
+  OPTIND=1 # Reset for getopts.
+  while getopts "hdu:" opt; do
+    case "$opt" in
+      h)
+        show_help
+        exit 0
+        ;;
+      d)
+        delete=true
+        ;;
+      u)
+        unprivileged_uid="${OPTARG}"
+        ;;
+      *)
+        echo "Unknown or malformed command line option: '--${OPTARG}'"
+        show_help
+        exit 1
+        ;;
+    esac
+  done
+  shift "$((OPTIND-1))"
+
+  if grep -q /docker /proc/self/cgroup; then
+    echo "It appears that this script is running from inside a container."
+    echo "Run this script as root on the container host machine."
+    exit 1
+  fi
+
+  if [ ${EUID} -ne 0 ]; then
+    echo "This script must be run as root. Canceling."
+    exit 1
+  fi
+
+  if [ $# -gt 0 ]; then
+    # there were arguments without options, this script doesn't use those.
+    echo "Invalid arguments: '$*'.  Canceling."
+    exit 2
+  fi
+
+  if [ "${delete}" == "false" ] && [ -z "${unprivileged_uid}" ]; then
+    echo "One of -d or -u must be specified. Canceling."
+    exit 1
+  fi
+
+  if [ "${delete}" == "true" ] && [ -n "${unprivileged_uid}" ]; then
+    echo "Specify either -d or -u but not both. Canceling."
+    exit 1
+  fi
+}
+
+main() {
+  get_arguments "$@"
+
+  if [ "${delete}" == true ]; then
+    delete_all_settings
+  else
+    if [[ ! "${unprivileged_uid}" =~ ^[0-9]+$ ]]; then
+      echo "unprivileged_uid must be a number but is ${unprivileged_uid}. Canceling."
+      exit 1
+    fi
+
+    if ! id "${unprivileged_uid}" &> /dev/null; then
+      echo "There is no user associated with UID ${unprivileged_uid}. Canceling."
+      exit 1
+    fi
+
+    setup_sysctl_settings
+    setup_limits
+    setup_unlimited_tasks
+  fi
+}
+
+main "$@"

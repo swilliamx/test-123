@@ -1,0 +1,303 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+#
+# This file is the copyrighted property of Tableau Software and is protected
+# by registered patents and other applicable U.S. and international laws and
+# regulations.
+#
+# Unlicensed use of the contents of this file is prohibited. Please refer to
+# the NOTICES.txt file for further details.
+#
+# -----------------------------------------------------------------------------
+
+set -o xtrace
+set -o nounset
+set -o errexit
+
+if [ -f "${ENV_FILE}" ]; then
+    export $(cat ${ENV_FILE} | xargs)
+fi
+
+if [[ "${HOSTNAME}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "Error: Invalid hostname, not accept to use an IP address format hostname"
+    exit 1
+fi
+
+if [ -f "${DATA_DIR}/supervisord/hostname-file" ]; then
+    prev_hostname=$(cat "${DATA_DIR}/supervisord/hostname-file")
+    if [ "${prev_hostname}" != "${HOSTNAME}" ]; then
+        echo "Error: Hostname is required to be same with the previous run"
+        echo "To enforce hostname to be the same wherever container runs, "
+        echo "Please specify hostname in kubeconfig file for a kubernetes "
+        echo "deployment or use the flag --hostname=<static-hostname> in  "
+        echo "docker command for a docker deployment"
+        exit 1
+    fi
+fi
+
+if [ ! "${ACCEPTEULA}" -eq 1 ]; then
+    echo "Error: Accept the EULA by using the build-image tool with the appropriate parameters."
+    echo "To view the EULA execute this command:"
+    echo "cat ${INSTALL_DIR}/packages/docs.${SERVICE_VERSION}/*EULA*"
+    echo "For example:"
+    echo "docker run -it <image-name> bash -c 'cat ${INSTALL_DIR}/packages/docs.${SERVICE_VERSION}/*EULA*'"
+    exit 1
+fi
+
+if [[ (-n "${HTTP_PROXY}" || -n "${HTTPS_PROXY}") && (-z "${NO_PROXY}") ]]; then
+    echo "Error: NO_PROXY variable should be set up with appropriate values"
+    echo "when either HTTP_PROXY or HTTPS_PROXY, or both of the values are set"
+    exit 1
+fi
+
+
+
+# This is a complicated way of saying 'printenv > /docker/env' except this code
+# will ensure that all values are quoted to protect any whitespace.
+while IFS='=' read -r -d '' key val; do
+    printf "%s=\"%s\"\n" "${key}" "${val}"
+done < <(env -0) > ${DOCKER_CONFIG}/env
+
+while [ "${BOOTSTRAP_INSTALL}" -eq 1 ] && [ "${WAIT_FOR_BOOTSTRAP_FILE}" -eq 1 ] && [ ! -f "${BOOTSTRAP_FILE}" ] && [ -z "${BOOTSTRAP_DATA}" ]; do
+    sleep 5
+done
+
+setup_basic_variables() {
+    data_dir="${DATA_DIR}"
+    data_dir_parent=$(readlink -m "${data_dir}"/..)
+    package_dir="${INSTALL_DIR}"/packages
+    bin_dir="${package_dir}"/bin."${SERVICE_VERSION}"
+    supervisord_dir="${data_dir}"/supervisord
+    data_dir_ready=false
+
+    # Any error during the server or worker install in previous run would have still created data dir, but that data dir is not ready. So any such data dir from the previous run
+    # is not useful for current run. A file is created to indicate error happened in the previous run. So when data dir exists and that particular
+    # file found, data dir is considered not ready.
+    if [ -d "${data_dir}" ] && [ ! -f "${data_dir}/logs/server-install-error" ]; then
+        data_dir_ready=true
+    fi
+}
+
+setup_supervisord() {
+    mkdir -p "${supervisord_dir}"/units
+
+    if "${data_dir_ready}"; then
+        start_init_service=false
+    else
+        start_init_service=true
+    fi
+
+    env_vars=()
+
+    [ -n "${HTTP_PROXY}"                      ] &&  env_vars+=("http_proxy=\"${HTTP_PROXY}\"")
+    [ -n "${HTTPS_PROXY}"                     ] &&  env_vars+=("https_proxy=\"${HTTPS_PROXY}\"")
+    [ -n "${NO_PROXY}"                        ] &&  env_vars+=("no_proxy=\"${NO_PROXY}\"")
+
+    # Creating a comma separated values of the environment
+    env_vars_string=$(IFS=, ; echo "${env_vars[*]-}")
+
+    cat > "${supervisord_dir}/supervisord.conf" << EOF
+[unix_http_server]
+file=%(here)s/supervisord.sock
+
+[supervisord]
+logfile=%(here)s/supervisord.log
+pidfile=%(here)s/supervisord.pid
+nodaemon=true
+environment=${env_vars_string}
+
+[rpcinterface:supervisor]
+supervisor.rpcinterface_factory = supervisor.rpcinterface:make_main_rpcinterface
+
+[supervisorctl]
+serverurl=unix://%(here)s/supervisord.sock
+
+[include]
+files = %(here)s/units/*.conf
+EOF
+
+    cat > "${supervisord_dir}/units/run-tableau-server.conf" << EOF
+[program:run-tableau-server]
+autostart=${start_init_service}
+startretries=0
+autorestart=false
+stopasgroup=true
+redirect_stderr=true
+stdout_logfile=${supervisord_dir}/run-tableau-server.log
+command=${DOCKER_CONFIG}/run-tableau-server
+EOF
+
+    cat > "${supervisord_dir}/units/stack-traces-from-coredumps.conf" << EOF
+[program:stack-traces-from-coredumps]
+autostart=true
+startretries=0
+autorestart=true
+stopasgroup=true
+redirect_stderr=true
+stdout_logfile=${supervisord_dir}/stack-traces-from-coredumps.log
+command=${DOCKER_CONFIG}/stack-traces-from-coredumps
+EOF
+
+chown -R "${UNPRIVILEGED_USERNAME}":"${UNPRIVILEGED_GROUP_NAME}" "${supervisord_dir}"
+
+}
+
+create_files() {
+    # If a registeration file mount is provided, then generate the registration file.
+    if [ ! -z "${REGISTRATION_DATA}" ]; then
+        echo "${REGISTRATION_DATA}" > "${REGISTRATION_FILE}"
+    fi
+
+    # If config data is provided, then generate the config file.
+    if [ ! -z "${CONFIG_DATA}" ]; then
+        echo "${CONFIG_DATA}" > "${CONFIG_FILE}"
+    fi
+
+    # If bootstrap data is provided, then generate the bootstrap file.
+    if [ ! -z "${BOOTSTRAP_DATA}" ]; then
+        echo "${BOOTSTRAP_DATA}" > "${BOOTSTRAP_FILE}"
+    fi
+
+    # Create a velocity.log file here because of the working directory for all services of supervisord is set to the root 
+    # directory of the system, causing Spring not able to start velocity engine when configuring SAML for server. So the 
+    # hack here is to create a velocity.log under ${data_dir} before server is initialized and also create a symlink under
+    # root directory. This is a temporary solution. The permanent solution would be change the working dirs for all services
+    # of supervisord to be under ${data_dir} which will require monolith change.
+    if [ -d "${data_dir}" ] && [ ! -f "${data_dir}/velocity.log" ]; then
+        touch "${data_dir}/velocity.log"
+        chown "${UNPRIVILEGED_USERNAME}":"${UNPRIVILEGED_GROUP_NAME}" "${data_dir}/velocity.log"
+    fi
+
+    # Persist the hostname into a file to enforce the next run has the same hostname
+    echo "${HOSTNAME}" > "${DATA_DIR}/supervisord/hostname-file"
+}
+
+setup_data_dir() {
+    if [ -d "${data_dir}" ]; then
+        local writable=0
+        test -w "${data_dir}" && writable=1
+        if [ "${writable}" -ne 1 ]; then
+            errcho "Data directory is not writeable by this user: ${data_dir}"
+            errcho "Current User: ${UNPRIVILEGED_USERNAME} (${UNPRIVILEGED_TABLEAU_UID}:${UNPRIVILEGED_TABLEAU_GID})"
+            exit 1
+        fi
+    fi
+    mkdir --parents "${data_dir}"/logs
+    mkdir --parents "${data_dir}"/config
+    mkdir --parents "${data_dir}/data/${CONFIG_NAME}"
+    mkdir --parents "${data_dir}"/temp
+
+    if [ "${BOOTSTRAP_INSTALL}" -eq "1" ]; then
+        cp -f "${BOOTSTRAP_FILE}" "${data_dir}/temp/bootstrap.cfg"
+    fi
+
+    chown -R "${UNPRIVILEGED_USERNAME}":"${UNPRIVILEGED_GROUP_NAME}" "${data_dir}"
+}
+
+setup_remote_user() {
+    set +ex
+    echo "Setting up remote user"
+    if [ ! -z "${TSM_REMOTE_USERNAME}" ]; then
+        if [ ! -z "${TSM_REMOTE_PASSWORD}" ]; then
+            echo "found remote pw env var"
+            remote_pw="${TSM_REMOTE_PASSWORD}"
+        elif [ -f "${TSM_REMOTE_PASSWORD_FILE}" ]; then
+            echo "found remote pw file"
+            remote_pw=$(cat "${TSM_REMOTE_PASSWORD_FILE}")
+        else
+            echo "ERROR: No password found for remote user ${TSM_REMOTE_USERNAME}"
+            echo "Provide a password for the user by doing one of the following:"
+            echo "a) Set the TSM_REMOTE_PASSWORD environment variable when starting the image"
+            echo "b) Mount a file in the container that lists the password."
+            echo "   The file path must correspond to the TSM_REMOTE_PASSWORD_FILE environment variable"
+            echo "   TSM_REMOTE_PASSWORD_FILE default location: ${TSM_REMOTE_PASSWORD_FILE}"
+            exit 1
+        fi
+        echo "Setting remote user password..."
+        su -l ${TSM_REMOTE_USERNAME} -c "printf \"${remote_pw}\\n\" | rpasswd"
+        local return_code=$(echo $?)
+        if [ ${return_code} -eq 0 ]; then
+            echo "Remote password is set."
+        else
+            echo "Failed to set remote password, rpasswd exit code: ${return_code}"
+            exit 1
+        fi
+    fi
+    set -ex
+}
+
+clean_temp_files() {
+    if "${data_dir_ready}"; then
+        # You get here if the container was killed ungracefully and apache went away and its pid file is still in the
+        # data directory.
+        pid_file="${data_dir}/data/tabsvc/httpd/httpd.pid"
+        if [ -f "${pid_file}" ]; then
+            rm "${pid_file}"
+        fi
+    fi
+}
+
+# This is to remove the group permissions for pgsql service directory.
+# These permissions are modified when Security Context is used with volumes in K8s.
+set_permissions_for_pgsql_dir() {
+    if "${data_dir_ready}"; then
+        service_dir="${DATA_DIR}/data/${CONFIG_NAME}"
+        if [ -d "${service_dir}/pgsql" ]; then
+            chmod -R go-rwxs "${service_dir}/pgsql"
+        fi
+
+        if [ -f "${service_dir}/config/pgsql_0.${SERVICE_VERSION}/security/server.key" ]; then
+            chmod go-rwxs "${service_dir}/config/pgsql_0.${SERVICE_VERSION}/security/server.key"
+        fi
+    fi
+}
+
+validate_config_file() {
+    node_count=$(jq 'select(.topologyVersion.nodes)|.topologyVersion.nodes|keys|length' "${CONFIG_FILE}")
+    coordination_serv_nodes_count=$(jq '[select(.topologyVersion.nodes) | .topologyVersion.nodes | to_entries[] | select(any(.value[]; has("appzookeeper"))) | .key ] | length' "${CONFIG_FILE}")
+    coordination_serv_nodes=$(jq -r 'select(.topologyVersion.nodes)| .topologyVersion.nodes | to_entries[] | select(any(.value[]; has("appzookeeper"))) | .key' "${CONFIG_FILE}")
+
+    # detect topology configuration in the config file, start to validate
+    if [ ! -z "${node_count}" ]; then
+        if [[ "${coordination_serv_nodes_count}" -ne 1 && "${coordination_serv_nodes_count}" -ne 3 && "${coordination_serv_nodes_count}" -ne 5 ]]; then
+            echo "ERROR: the number of appzookeeper should only be 1, 3 or 5"
+            exit 1
+        fi
+
+        if [[ "${coordination_serv_nodes_count}" -eq 1 && "${coordination_serv_nodes}" != "node1" ]]; then
+            echo "ERROR: appzookeeper must be on the node1 when the number of appzookeeper is 1"
+            exit 1
+        fi
+    fi
+}
+
+set_lease_time() {
+     cp "${DOCKER_CONFIG}/config/tabsvc.yml" "${DATA_DIR}/config"
+     if [ -n "${REQUESTED_LEASE_TIME}" ]; then
+        echo "Non-default lease time is set. Duration: ${REQUESTED_LEASE_TIME} seconds"
+        echo "activationservice.requested_duration_seconds: ${REQUESTED_LEASE_TIME}" >> "${DATA_DIR}/config/tabsvc.yml"
+     fi
+}
+
+copy_metadata_to_supervisord_dir() {
+    cp "${DOCKER_CONFIG}/.metadata.conf" "${supervisord_dir}/.metadata.conf"
+    if [ -f "${DOCKER_CONFIG}/.upgrade_metadata.conf" ]; then
+        cp "${DOCKER_CONFIG}/.upgrade_metadata.conf" "${supervisord_dir}/.upgrade_metadata.conf"
+    fi
+}
+
+main() {
+    setup_basic_variables
+    setup_data_dir
+    setup_remote_user
+    setup_supervisord
+    set_permissions_for_pgsql_dir
+    clean_temp_files
+    create_files
+    validate_config_file
+    set_lease_time
+    copy_metadata_to_supervisord_dir
+    exec supervisord -c "${data_dir}/supervisord/supervisord.conf"
+}
+
+main "$@"

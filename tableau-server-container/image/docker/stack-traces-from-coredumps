@@ -1,0 +1,66 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+#
+# This file is the copyrighted property of Tableau Software and is protected
+# by registered patents and other applicable U.S. and international laws and
+# regulations.
+#
+# Unlicensed use of the contents of this file is prohibited. Please refer to
+# the NOTICES.txt file for further details.
+#
+# -----------------------------------------------------------------------------
+
+set -o nounset # exit script if trying to use an uninitialized variable
+set -o errexit # exit the script if any statement returns a non-true return value
+
+while true; do
+  # This script will run from the moment that the container starts so we must wait until
+  # there is a server to start processing
+  if [ -f /etc/opt/tableau/tableau_server/environment.bash ]; then
+    . /etc/opt/tableau/tableau_server/environment.bash
+    outdir="${TABLEAU_SERVER_DATA_DIR}/data/tabsvc/crashdumps/stacktraces"
+    mkdir -p "${outdir}"
+    chmod 0770 "${outdir}"
+    echo "Found Tableau Server ${TABLEAU_SERVER_DATA_DIR_VERSION}"
+    break
+  fi
+  sleep 60
+done
+
+while true; do
+  shopt -s nullglob
+  for corefile in "${TABLEAU_SERVER_DATA_DIR}"/coredump:*; do
+    # if the corefile is very young, it may still being written. Wait until it's been 30 seconds
+    # since its last modification before processing it.
+    secs_since_modified=$(($(date +%s) - $(date +%s -r ${corefile})))
+    [ "${secs_since_modified}" -lt 30 ] && continue
+
+    echo "Processing coredump file ${corefile}"
+
+    # Relies on the core_pattern being set to coredump:%p:%s:%t:%E
+    IFS=: read -ra splitfilename <<< "${corefile}"
+    pid="${splitfilename[1]}"
+    signal="${splitfilename[2]}"
+    timestamp="${splitfilename[3]}"
+    program="${splitfilename[4]//\!//}"
+
+    outfile="${outdir}/$(basename ${program}).${pid}.${signal}.${timestamp}.txt"
+    touch "${outfile}"
+    chmod 0660 "${outfile}"
+
+    echo "Crashing pid:      ${pid}"
+    echo "Crashed by signal: ${signal}"
+    echo "Time of crash:     $(date --date=@${timestamp}) (${timestamp})"
+    echo "Crashing program:  ${program}"
+    echo "Stacktrace file:   ${outfile}"
+
+    # Run gdb over the core file to extract the stack traces of all the threads
+    gdb </dev/null "${program}" --nx --batch -c "${corefile}" -ex "set pagination off" -ex "set height 0" -ex "set width 0" -ex "info threads" -ex "thread apply all backtrace" -ex detach -ex quit > "${outfile}"
+
+    echo "Deleting coredump file after processing"
+    rm -f "${corefile}"
+  done
+  shopt -u nullglob
+
+  sleep 60
+done

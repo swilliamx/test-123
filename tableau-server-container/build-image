@@ -1,0 +1,169 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+#
+# This file is the copyrighted property of Tableau Software and is protected
+# by registered patents and other applicable U.S. and international laws and
+# regulations.
+#
+# Unlicensed use of the contents of this file is prohibited. Please refer to
+# the NOTICES.txt file for further details.
+#
+# -----------------------------------------------------------------------------
+
+set -e
+
+source "$(dirname "${BASH_SOURCE[0]}")"/build-utils
+
+show_help() {
+  cat <<EOM
+  Usage: $(basename "$0") --accepteula -i [INPUT_IMAGE_NAME] -n [OUTPUT_IMAGE_NAME] [optional arguments]
+
+  Creates new Tableau Server image with pre-installed database drivers, configuration, and instructions.
+
+  REQUIRED
+
+    --accepteula              Indicate that you have accepted the End User License Agreement (EULA).
+                              The EULA is available in the EULA directory of this tool.
+
+    -i installer              Path to the Tableau Server installer.
+
+  OPTIONAL
+
+    -o output name            Tag of target generated Tableau Server image.
+
+    -e environment file       Optional environment file to configuration overrides to docker image at build time.
+
+    -v setup tool version     Prints the Setup tool version. 
+
+    -b base image version     Prints the default base image URL.
+EOM
+}
+
+set_basic_variables() {
+  set_shared_variables
+  customer_src_dir="${root}/customer-files"
+  customer_target_dir="${context_dir}/docker/customer-files"
+  src_reg_file="${root}/reg-info.json"
+  target_env_file="${customer_target_dir}/environment"
+}
+
+resolve_arguments() {
+  eula_check
+  resolve_installer
+  resolve_version
+
+  if [[ -z "${output_name}" ]]; then
+    output_name="tableau_server_image:${version}"
+  fi
+}
+
+get_arguments() {
+  OPTIND=1 # Reset for getopts (-: to allow long options)
+  while getopts "i:o:e:vbh-:" opt; do
+    case "$opt" in
+      i)
+        installer="${OPTARG}"
+        ;;
+      o)
+        output_name="${OPTARG}"
+        ;;
+      e)
+        src_env_file="${OPTARG}"
+        if [ ! -f "${src_env_file}" ]; then
+          echo "Environment file not found: ${src_env_file}"
+          exit 1
+        fi
+        ;;
+      v)
+        echo "Setup tool version: ${TABLEAU_SERVER_CONTAINER_SETUP_TOOL_VERSION}"
+        exit 0
+        ;;
+      b)
+        echo "Base Image URL: ${BASE_IMAGE_URL}"
+        exit 0
+        ;;
+      h)
+        show_help
+        exit 0
+        ;;
+      -)# handle long options
+        # split arguments by '=' and store in local array
+        local args
+        IFS='=' read -r -a args <<< "${OPTARG}"
+        case "${args[0]}" in
+          accepteula)
+            eula_accepted=1
+            ;;
+          *)
+            echoerr "Unknown or malformed command line option: '--${OPTARG}'"
+            show_help
+            exit 2
+          ;;
+        esac
+        ;;
+      esac
+  done
+
+  if [ $OPTIND -eq 1 ]; then
+    show_help
+    exit 2
+  fi
+
+  shift "$((OPTIND-1))"
+
+  if [[ $# > 0 ]]; then
+    echoerr "Invalid arguments: '$*'.  Canceling."
+    show_help
+    exit 2
+  fi
+}
+
+setup_customer_dir() {
+  if [ -d "${customer_target_dir}" ]; then
+    rm -rf "${customer_target_dir}"
+  fi
+  cp -r "${customer_src_dir}" "${customer_target_dir}"
+
+  if [ -f "${src_reg_file}" ]; then
+    target_reg_file="${customer_target_dir}"/$(basename "${src_reg_file}")
+    cp "${src_reg_file}" "${customer_target_dir}/reg-info.json"
+  else
+    echo "Registration file not found: ${src_reg_file}"
+  fi
+
+  if [ -f "${src_env_file}" ]; then
+    cp "${src_env_file}" "${target_env_file}"
+  fi
+}
+
+build_image() {
+  echo "Building image ${output_name} from ${image_name}"
+  echo "Output Name: ${output_name}"
+  echo "Installer: ${installer}"
+  echo "Context: ${context_dir}"
+  echo "Version: ${version}"
+  docker_build_cmd=("docker build -t \"${output_name}\""
+    --build-arg "installerFile=\"${installer_filename}\""
+    --build-arg "serviceName=\"Tableau Server\""
+    --build-arg "versionString=\"${version}\""
+    --build-arg "eulaAccepted=\"${eula_accepted}\"")
+
+  add_args_to_dockerfile
+  docker_build_cmd+=("${context_dir}")
+
+  /bin/bash -c "${docker_build_cmd[*]}"
+
+  echo "Build finished"
+}
+
+main() {
+  set_basic_variables
+  get_arguments "$@"
+  resolve_arguments
+  check_docker_installed
+  setup_customer_dir
+  setup_metadata_file
+  build_image
+}
+
+main "$@"

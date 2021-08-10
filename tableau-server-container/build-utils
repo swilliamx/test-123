@@ -1,0 +1,130 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+#
+# This file is the copyrighted property of Tableau Software and is protected
+# by registered patents and other applicable U.S. and international laws and
+# regulations.
+#
+# Unlicensed use of the contents of this file is prohibited. Please refer to
+# the NOTICES.txt file for further details.
+#
+# -----------------------------------------------------------------------------
+
+# This is util file for build scripts. Common code in both build-image and build-upgrade-image
+
+set -o errexit # exit the script if any statement returns a non-true return value
+
+echoerr() { echo "$@" 1>&2; }
+
+set_shared_variables() {
+  root="$( cd "$(dirname "$0")" ; pwd -P )"
+  context_dir="${root}"/image
+  metadata_file="${context_dir}/.metadata.conf"
+  source "${root}"/.metadata.conf
+}
+
+check_docker_installed() {
+  if ! command -v docker > /dev/null 2>&1; then
+    echoerr "ERROR: Docker must be installed before running this script."
+    echoerr "Exiting..."
+    exit 1
+  fi
+}
+
+add_args_to_dockerfile() {
+  declare -A env_array
+  env_array=( [UNPRIVILEGED_USERNAME]=unprivilegedUsername \
+              [UNPRIVILEGED_GROUP_NAME]=unprivilegedGroupName \
+              [BASE_IMAGE_URL]=baseImageURL )
+  for KEY in "${!env_array[@]}"; do
+    # set the value to the default (if one exists)
+    value=${!KEY}
+    # Check if environment variable is set in the customer environment file
+    if [ -f "${target_env_file}" ]; then
+      env_file_value=$(sed -n -e "/${KEY}=.*/p" "${target_env_file}" | cut -d "=" -f2 )
+      if [ ! -z "${env_file_value}" ]; then
+        value=${env_file_value}
+      fi
+    fi
+    if [ ! -z "${value}" ]; then
+      docker_build_cmd+=(--build-arg "${env_array[${KEY}]}=${value}")
+    fi
+  done
+}
+
+eula_check() {
+  if [[ "${eula_accepted}" != 1 ]]; then
+    echoerr "You must accept the End User License Agreement (EULA) using --accepteula.  Canceling."
+    echoerr "You can find the EULA in EULA directory of this tool."
+    echoerr ""
+    exit 1
+  fi
+}
+
+resolve_installer() {
+  if [[ -z "${installer}" ]]; then
+    echoerr "ERROR: tableau installer file must be specified (--installer)"
+    echoerr "Exiting..."
+    exit 1
+  fi
+  installer_filename=$(basename "${installer}")
+  installer_destination="${context_dir}/${installer_filename}"
+
+  if [ -f "${installer_destination}" ]; then
+    echo "Found installer at destination: ${installer_destination}"
+  else
+    if [ ! -f "${installer}" ]; then
+      echoerr "ERROR: Installer file ${installer} not found (-i)"
+      echoerr "Exiting..."
+      exit 1
+    fi
+    echo "Copying installer to docker context directory: $installer_destination"
+    cp "${installer}" "${installer_destination}"
+  fi
+}
+
+resolve_version() {
+  version=$(head -3 ${installer_destination} | tail -2 | strings | head -1 | sed 's/.*\-//')
+  if [ -z "${version}" ]; then
+    echoerr "Tableau Server version could not be determined, exiting..."
+    exit 1
+  fi
+
+  # Development check
+  if [[ "${version}" == *"near"* ]]; then
+      return 0
+  fi
+  version_number=${version//[.]/}
+
+  # Official check
+  re='^[0-9]+$'
+  if ! [[ $version_number =~ $re ]] ; then
+    echo "Warning: version is not officially recognized: ${version}"
+  else
+    if [ -z "${TABLEAU_SERVER_INSTALLER_VERSION_MAX}" ] && [ ${version_number} -lt ${TABLEAU_SERVER_INSTALLER_VERSION_MIN//[.]/} ]; then
+      echo "Error: This version of Tableau Server is not supported: ${version}"
+      echo "Use a version that is equal to or released later than version: ${TABLEAU_SERVER_INSTALLER_VERSION_MIN}"
+      exit 1
+    fi
+    if [ -z "${TABLEAU_SERVER_INSTALLER_VERSION_MIN}" ] && [ ${version_number} -gt ${TABLEAU_SERVER_INSTALLER_VERSION_MAX//[.]/} ]; then
+      echo "Error: This version of Tableau Server is not supported: ${version}"
+      echo "Use a version that is equal to or released earlier than version: ${TABLEAU_SERVER_INSTALLER_VERSION_MAX}"
+      exit 1
+    fi
+    if [[ (! -z "${TABLEAU_SERVER_INSTALLER_VERSION_MAX}") && (! -z "${TABLEAU_SERVER_INSTALLER_VERSION_MIN}") && (${version_number} -lt ${TABLEAU_SERVER_INSTALLER_VERSION_MIN//[.]/} || ${version_number} -gt ${TABLEAU_SERVER_INSTALLER_VERSION_MAX//[.]/}) ]]; then
+      echo "Error: This version of Tableau Server is not supported: ${version}"
+      echo "Use a version that is between the version: ${TABLEAU_SERVER_INSTALLER_VERSION_MIN} and the version: ${TABLEAU_SERVER_INSTALLER_VERSION_MAX}"
+      exit 1
+    fi
+  fi
+}
+
+setup_metadata_file() {
+  rm -f "${metadata_file}"
+
+  cp "${root}/.metadata.conf" "$metadata_file"
+  echo "TABLEAU_SERVER_INSTALLER_VERSION=${version}" >> "${metadata_file}"
+
+  docker_version=$(docker -v | sed -nre 's/^[^0-9]*(([0-9]+\.)*[0-9]+).*/\1/p')
+  echo "DOCKER_VERSION_BUILD=${docker_version}" >> "${metadata_file}"
+}

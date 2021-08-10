@@ -1,0 +1,24 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+#
+# This file is the copyrighted property of Tableau Software and is protected
+# by registered patents and other applicable U.S. and international laws and
+# regulations.
+#
+# Unlicensed use of the contents of this file is prohibited. Please refer to
+# the NOTICES.txt file for further details.
+#
+# -----------------------------------------------------------------------------
+
+set -o errexit
+
+source /docker/env
+
+super_conf="${DATA_DIR}"/supervisord/supervisord.conf
+service_list=(tabadminagent tabadmincontroller clientfileservice licenseservice appzookeeper)
+for i in "${service_list[@]}"; do
+    if ! supervisorctl -c "${super_conf}" status | grep "${i}" | grep -i "RUNNING"; then
+        echo "${i} is not running"
+        exit 1
+    fi
+done
